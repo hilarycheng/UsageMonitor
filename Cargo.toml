@@ -1,0 +1,35 @@
+[package]
+name = "usage-monitor"
+version = "0.1.0"
+edition = "2024"
+description = "Codex 每週額度監察與 Windows 通知"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+windows = { version = "0.62.2", features = [
+    "Data_Xml_Dom",
+    "Foundation",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_Variant",
+    "Win32_System_WinRT",
+    "Win32_System_Console",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+strip = true
+lto = "thin"
