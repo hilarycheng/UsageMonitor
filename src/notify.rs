@@ -38,7 +38,14 @@ use windows::{
 const APP_ID: &str = "UsageMonitor.CodexWeekly";
 static SHORTCUT_READY: Mutex<bool> = Mutex::new(false);
 
-struct WinRt;
+pub struct WinRt;
+
+impl WinRt {
+    pub fn initialize() -> Result<Self> {
+        unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.context("無法初始化 Windows 通知服務")?;
+        Ok(Self)
+    }
+}
 
 impl Drop for WinRt {
     fn drop(&mut self) {
@@ -55,8 +62,6 @@ pub fn show_reset(body: &str) -> Result<()> {
 }
 
 fn send(title: &str, body: &str, tag: &str) -> Result<()> {
-    unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.context("無法初始化 Windows 通知服務")?;
-    let _winrt = WinRt;
     ensure_shortcut()?;
     let notifier = notifier()?;
 

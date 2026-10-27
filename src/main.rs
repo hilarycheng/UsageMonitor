@@ -8,8 +8,12 @@ mod usage;
 use std::{
     env,
     ffi::OsString,
-    os::windows::io::{FromRawHandle, OwnedHandle},
+    os::windows::{
+        io::{FromRawHandle, OwnedHandle},
+        process::CommandExt,
+    },
     path::PathBuf,
+    process::{Command, Stdio},
     sync::mpsc::RecvTimeoutError,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -20,7 +24,7 @@ use windows::{
         Foundation::{ERROR_ALREADY_EXISTS, FILETIME, GetLastError, SYSTEMTIME},
         System::{
             Console::{ATTACH_PARENT_PROCESS, AttachConsole},
-            Threading::CreateMutexW,
+            Threading::{CreateMutexW, DETACHED_PROCESS},
             Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime},
         },
         UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW},
@@ -152,12 +156,12 @@ fn check(program: &std::path::Path) -> Result<(usage::WeeklyUsage, String)> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     usage::check_fresh(&usage, now)?;
     let reset = if usage.resets_at <= now {
-        "服務尚未提供下一次重設時間".to_owned()
+        "重設：服務尚未提供下一次重設時間".to_owned()
     } else {
-        local_reset_time(usage.resets_at)?
+        format!("將會重設：{}", local_reset_time(usage.resets_at)?)
     };
     let body = format!(
-        "已用 {:.1}%，剩餘 {:.1}%\n重設：{}",
+        "已用 {:.1}%，剩餘 {:.1}%\n{}",
         usage.used_percent,
         (100.0 - usage.used_percent).max(0.0),
         reset
@@ -166,11 +170,25 @@ fn check(program: &std::path::Path) -> Result<(usage::WeeklyUsage, String)> {
 }
 
 fn run() -> Result<()> {
-    let options = Options::parse(env::args_os().skip(1))?;
+    let args: Vec<_> = env::args_os().skip(1).collect();
+    if args.is_empty() {
+        Command::new(env::current_exe().context("無法取得程式路徑")?)
+            .arg("--background-child")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(DETACHED_PROCESS.0)
+            .spawn()
+            .context("無法啟動背景監察程式")?;
+        return Ok(());
+    }
+    let background_child = args.len() == 1 && args[0] == "--background-child";
+    let options = Options::parse(args.into_iter().filter(|_| !background_child))?;
     if options.help {
         println!("{HELP}");
         return Ok(());
     }
+    let _winrt = notify::WinRt::initialize()?;
     if options.test_notification {
         notify::show(
             "Codex 額度監察：測試通知",
@@ -267,7 +285,11 @@ fn run() -> Result<()> {
 }
 
 fn main() {
-    let console = unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_ok() || cfg!(debug_assertions);
+    let background_child = env::args_os()
+        .skip(1)
+        .eq([OsString::from("--background-child")]);
+    let console = !background_child
+        && (unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_ok() || cfg!(debug_assertions));
     let command_line = env::args_os().skip(1).any(|arg| {
         matches!(
             arg.to_str(),
