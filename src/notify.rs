@@ -19,7 +19,8 @@ use windows::{
         Foundation::{ERROR_NOT_FOUND, PROPERTYKEY},
         System::{
             Com::{
-                CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, IPersistFile, STGM_READ,
+                CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, IPersistFile,
+                STGM_READWRITE,
                 StructuredStorage::{PROPVARIANT, PVCHF_DEFAULT, PropVariantChangeType},
             },
             Variant::VT_LPWSTR,
@@ -61,15 +62,34 @@ pub fn show_reset(body: &str) -> Result<()> {
     send("Codex 每週額度已重設！", body, "reset")
 }
 
-fn send(title: &str, body: &str, tag: &str) -> Result<()> {
-    ensure_shortcut()?;
-    let notifier = notifier()?;
+pub fn show_banked(body: &str) -> Result<()> {
+    send("Codex Banked Reset 即將到期", body, "banked")
+}
 
+pub fn show_tibo(tweet: &crate::tibo::Tweet) -> Result<()> {
+    send_xml(&tibo_xml(tweet), "tibo")
+}
+
+fn tibo_xml(tweet: &crate::tibo::Tweet) -> String {
+    format!(
+        "<toast duration=\"long\" activationType=\"protocol\" launch=\"usage-monitor-tibo:{}\"><visual><binding template=\"ToastGeneric\"><text>Tibo 新貼文</text><text>{}</text></binding></visual></toast>",
+        tweet.id,
+        escape_xml(&tweet.text)
+    )
+}
+
+fn send(title: &str, body: &str, tag: &str) -> Result<()> {
     let xml = format!(
         "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>",
         escape_xml(title),
         escape_xml(body)
     );
+    send_xml(&xml, tag)
+}
+
+fn send_xml(xml: &str, tag: &str) -> Result<()> {
+    ensure_shortcut()?;
+    let notifier = notifier()?;
     let document = XmlDocument::new().context("無法建立通知內容")?;
     document
         .LoadXml(&HSTRING::from(xml))
@@ -144,7 +164,7 @@ fn ensure_shortcut() -> Result<()> {
             .context("無法取得 Windows 通知身分屬性")?;
         if exists {
             persist
-                .Load(PCWSTR(shortcut_path.as_ptr()), STGM_READ)
+                .Load(PCWSTR(shortcut_path.as_ptr()), STGM_READWRITE)
                 .context("無法讀取現有通知捷徑")?;
             let mut target = vec![0u16; 32768];
             link.GetPath(&mut target, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)
@@ -225,6 +245,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tibo_notification_uses_long_duration_and_click_protocol() {
+        let xml = tibo_xml(&crate::tibo::Tweet {
+            id: "123".into(),
+            timestamp_ms: 1000,
+            text: "文字 <&>".into(),
+        });
+        assert!(xml.contains("duration=\"long\""));
+        assert!(xml.contains("activationType=\"protocol\" launch=\"usage-monitor-tibo:123\""));
+        assert!(xml.contains("文字 &lt;&amp;&gt;"));
+    }
+
+    #[test]
     fn escapes_markup_and_preserves_chinese() {
         assert_eq!(
             escape_xml("用量 <80%> & \"額度\" '剩餘'"),
@@ -249,5 +281,26 @@ mod tests {
             }),
             "測試通知未出現在 Windows 通知記錄"
         );
+    }
+
+    #[test]
+    #[ignore = "需先啟動 release 程式發送 Tibo 通知"]
+    fn startup_tibo_notification_is_clickable_and_kept_in_history() {
+        let _winrt = WinRt::initialize().unwrap();
+        let notifications = ToastNotificationManager::History()
+            .unwrap()
+            .GetHistoryWithId(&HSTRING::from(APP_ID))
+            .unwrap();
+        let toast = notifications
+            .into_iter()
+            .find(|toast| {
+                toast.Group().is_ok_and(|group| group == "usageMonitor")
+                    && toast.Tag().is_ok_and(|tag| tag == "tibo")
+            })
+            .expect("啟動後應有 Tibo 通知記錄");
+        let xml = toast.Content().unwrap().GetXml().unwrap().to_string_lossy();
+        assert!(xml.contains("duration=\"long\""));
+        assert!(xml.contains("activationType=\"protocol\""));
+        assert!(xml.contains("launch=\"usage-monitor-tibo:"));
     }
 }

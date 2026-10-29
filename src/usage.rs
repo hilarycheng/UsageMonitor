@@ -9,6 +9,54 @@ pub struct WeeklyUsage {
     pub resets_at: i64,
 }
 
+#[derive(Debug, PartialEq)]
+pub struct BankedReset {
+    pub count: u64,
+    pub expires_at: Option<i64>,
+    pub incomplete: bool,
+}
+
+pub fn banked_due(expiry: Option<i64>, now: i64, hour: u16, last_notice: Option<i64>) -> bool {
+    (7..22).contains(&hour)
+        && last_notice.is_none_or(|last| now.saturating_sub(last) >= 2 * 60 * 60)
+        && expiry.is_some_and(|time| time > now && time - now <= 48 * 60 * 60)
+}
+
+pub fn parse_banked(result: &Value, now: i64) -> Option<BankedReset> {
+    let resets = result.get("rateLimitResetCredits")?;
+    let count = resets.get("availableCount")?.as_u64()?;
+    if count == 0 {
+        return Some(BankedReset {
+            count,
+            expires_at: None,
+            incomplete: false,
+        });
+    }
+    let Some(credits) = resets.get("credits").and_then(Value::as_array) else {
+        return Some(BankedReset {
+            count,
+            expires_at: None,
+            incomplete: true,
+        });
+    };
+    let mut expiries = Vec::new();
+    for credit in credits {
+        if credit.get("status").and_then(Value::as_str) == Some("available")
+            && let Some(expiry) = credit
+                .get("expiresAt")
+                .and_then(Value::as_i64)
+                .filter(|&time| time > now)
+        {
+            expiries.push(expiry);
+        }
+    }
+    Some(BankedReset {
+        count,
+        expires_at: expiries.iter().copied().min(),
+        incomplete: expiries.len() as u64 != count,
+    })
+}
+
 pub fn parse_weekly(result: &Value) -> Result<WeeklyUsage> {
     let bucket = result
         .get("rateLimitsByLimitId")
@@ -126,6 +174,71 @@ pub fn check_fresh(usage: &WeeklyUsage, now: i64) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn banked_resets_distinguish_unknown_empty_and_incomplete_details() {
+        assert_eq!(parse_banked(&json!({}), 100), None);
+        assert_eq!(
+            parse_banked(
+                &json!({"rateLimitResetCredits": {"availableCount": 0}}),
+                100
+            ),
+            Some(BankedReset {
+                count: 0,
+                expires_at: None,
+                incomplete: false
+            })
+        );
+        let mut result = json!({"rateLimitResetCredits": {"availableCount": 2, "credits": [
+            {"status": "available", "expiresAt": 300},
+            {"status": "available", "expiresAt": 200}
+        ]}});
+        assert_eq!(
+            parse_banked(&result, 100),
+            Some(BankedReset {
+                count: 2,
+                expires_at: Some(200),
+                incomplete: false
+            })
+        );
+        result["rateLimitResetCredits"]["credits"][1]["expiresAt"] = Value::Null;
+        assert_eq!(
+            parse_banked(&result, 100),
+            Some(BankedReset {
+                count: 2,
+                expires_at: Some(300),
+                incomplete: true
+            })
+        );
+        result["rateLimitResetCredits"]["credits"] = Value::Null;
+        assert_eq!(
+            parse_banked(&result, 100),
+            Some(BankedReset {
+                count: 2,
+                expires_at: None,
+                incomplete: true
+            })
+        );
+    }
+
+    #[test]
+    fn banked_reminder_is_limited_to_48_hours_and_daytime() {
+        let expiry = 1_000_000;
+        assert!(!banked_due(Some(expiry), expiry - 48 * 3600 - 1, 7, None));
+        assert!(banked_due(Some(expiry), expiry - 48 * 3600, 7, None));
+        assert!(banked_due(Some(expiry), expiry - 1, 21, None));
+        assert!(!banked_due(Some(expiry), expiry - 1, 22, None));
+        assert!(!banked_due(Some(expiry), expiry - 1, 6, None));
+        assert!(!banked_due(Some(expiry), expiry, 7, None));
+        assert!(!banked_due(None, expiry - 1, 7, None));
+        assert!(!banked_due(
+            Some(expiry),
+            expiry - 1,
+            9,
+            Some(expiry - 7200)
+        ));
+        assert!(banked_due(Some(expiry), expiry - 1, 9, Some(expiry - 7201)));
+    }
 
     fn sample(percent: f64, reset: i64) -> WeeklyUsage {
         WeeklyUsage {
