@@ -179,36 +179,57 @@ fn check(
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
     usage::check_fresh(&usage, now)?;
     let banked = usage::parse_banked(&result, now);
-    let reset = if usage.resets_at <= now {
-        "每週重設：時間未提供".to_owned()
+    let body = format_usage(&usage, banked.as_ref(), now)?;
+    Ok((usage, banked, body))
+}
+
+fn format_usage(
+    usage: &usage::WeeklyUsage,
+    banked: Option<&usage::BankedReset>,
+    now: i64,
+) -> Result<String> {
+    let mut rows = vec![if usage.resets_at > now {
+        (
+            Some(usage.resets_at),
+            format!("每週重設：{}", local_reset_time(usage.resets_at)?),
+        )
     } else {
-        format!("每週重設：{}", local_reset_time(usage.resets_at)?)
-    };
-    let banked_text = match &banked {
-        None => "Banked Reset：無法取得".to_owned(),
-        Some(reset) if reset.count == 0 => "Banked Reset：0 次".to_owned(),
-        Some(reset) => {
-            let expiry = reset
-                .expires_at
-                .and_then(|time| local_reset_time(time).ok());
-            match expiry {
-                Some(time) if reset.incomplete => format!(
-                    "Banked Reset：{} 次\n已知最早到期：{}（明細不完整）",
-                    reset.count, time
-                ),
-                Some(time) => format!("Banked Reset：{} 次\n最早到期：{}", reset.count, time),
-                None => format!("Banked Reset：{} 次，到期時間未提供", reset.count),
+        (None, "每週重設：時間未提供".into())
+    }];
+    let mut body = format!(
+        "已用 {:.1}%，剩餘 {:.1}%",
+        usage.used_percent,
+        (100.0 - usage.used_percent).max(0.0)
+    );
+    if let Some(banked) = banked {
+        body.push_str(&format!("\nBanked Reset：{} 次", banked.count));
+        let mut known = 0u64;
+        for &expiry in &banked.expiries {
+            if expiry > now
+                && let Ok(time) = local_reset_time(expiry)
+            {
+                known += 1;
+                rows.push((Some(expiry), format!("Banked Reset {known} 到期：{time}")));
             }
         }
-    };
-    let body = format!(
-        "已用 {:.1}%，剩餘 {:.1}%\n{}\n{}",
-        usage.used_percent,
-        (100.0 - usage.used_percent).max(0.0),
-        reset,
-        banked_text
-    );
-    Ok((usage, banked, body))
+        let missing = banked.count.saturating_sub(known);
+        if missing > 0 {
+            rows.push((
+                None,
+                format!("Banked Reset：{missing} 次到期時間未提供（明細不完整）"),
+            ));
+        } else if banked.incomplete {
+            rows.push((None, "Banked Reset：明細不完整".into()));
+        }
+    } else {
+        rows.push((None, "Banked Reset：無法取得".into()));
+    }
+    rows.sort_by_key(|(time, _)| (time.is_none(), time.unwrap_or(0)));
+    for (_, text) in rows {
+        body.push('\n');
+        body.push_str(&text);
+    }
+    Ok(body)
 }
 
 fn run() -> Result<()> {
@@ -433,6 +454,73 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_display_sorts_all_dates_and_puts_unknown_times_last() {
+        let weekly = usage::WeeklyUsage {
+            used_percent: 10.0,
+            resets_at: 300,
+        };
+        let banked = usage::BankedReset {
+            count: 4,
+            expires_at: Some(200),
+            expiries: vec![200, 400, 500],
+            incomplete: true,
+        };
+        let body = format_usage(&weekly, Some(&banked), 100).unwrap();
+        let rows: Vec<_> = body.lines().skip(2).collect();
+        assert_eq!(
+            rows[0],
+            format!("Banked Reset 1 到期：{}", local_reset_time(200).unwrap())
+        );
+        assert_eq!(
+            rows[1],
+            format!("每週重設：{}", local_reset_time(300).unwrap())
+        );
+        assert_eq!(
+            rows[2],
+            format!("Banked Reset 2 到期：{}", local_reset_time(400).unwrap())
+        );
+        assert_eq!(
+            rows[3],
+            format!("Banked Reset 3 到期：{}", local_reset_time(500).unwrap())
+        );
+        assert!(rows[4].contains("1 次到期時間未提供（明細不完整）"));
+        let earlier = usage::WeeklyUsage {
+            resets_at: 150,
+            ..weekly.clone()
+        };
+        assert!(
+            format_usage(&earlier, Some(&banked), 100)
+                .unwrap()
+                .lines()
+                .nth(2)
+                .unwrap()
+                .starts_with("每週重設：")
+        );
+        let expired = usage::WeeklyUsage {
+            resets_at: 90,
+            ..weekly
+        };
+        let body = format_usage(&expired, Some(&banked), 100).unwrap();
+        assert!(
+            body.lines()
+                .nth(2)
+                .unwrap()
+                .starts_with("Banked Reset 1 到期：")
+        );
+        assert!(
+            body.lines()
+                .rev()
+                .take(2)
+                .any(|row| row == "每週重設：時間未提供")
+        );
+        assert!(
+            format_usage(&earlier, None, 100)
+                .unwrap()
+                .ends_with("Banked Reset：無法取得")
+        );
+    }
 
     #[test]
     fn rejects_invalid_intervals_and_conflicting_modes() {

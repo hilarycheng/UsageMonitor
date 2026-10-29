@@ -434,6 +434,38 @@ impl Drop for UiWindow {
 const POPUP_USAGE: i32 = 100;
 const POPUP_OPEN_TIBO: i32 = 101;
 const POPUP_TIBO_TEXT: i32 = 102;
+const POPUP_NEAREST_RESET: i32 = 103;
+const POPUP_OTHER_RESETS: i32 = 104;
+
+fn reset_parts(usage: &str) -> [String; 3] {
+    let lines: Vec<_> = usage.lines().collect();
+    let nearest = lines.iter().position(|line| {
+        (line.starts_with("每週重設：") || line.starts_with("Banked Reset "))
+            && line.ends_with("（本機時間）")
+    });
+    match nearest {
+        Some(index) => [
+            lines[..index].join("\r\n"),
+            lines[index].into(),
+            lines[index + 1..].join("\r\n"),
+        ],
+        None => [usage.into(), String::new(), String::new()],
+    }
+}
+
+fn usage_height(window: HWND, usage: &str, width: i32) -> Result<i32> {
+    reset_parts(usage)
+        .iter()
+        .filter(|part| !part.is_empty())
+        .try_fold(0, |height, part| {
+            Ok(height
+                + text_height(
+                    window,
+                    part,
+                    width - unsafe { GetSystemMetrics(SM_CXVSCROLL) },
+                )?)
+        })
+}
 
 fn usage_text(state: &UiState) -> String {
     let current = state.current.borrow();
@@ -489,6 +521,12 @@ fn create_popup(state: &UiState) -> Result<HWND> {
         .context("無法建立額度提示視窗")?;
         let controls = [
             (POPUP_USAGE, w!("STATIC"), WINDOW_STYLE::default()),
+            (POPUP_NEAREST_RESET, w!("STATIC"), WINDOW_STYLE::default()),
+            (
+                POPUP_OTHER_RESETS,
+                w!("EDIT"),
+                WS_VSCROLL | WINDOW_STYLE((ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32),
+            ),
             (
                 POPUP_OPEN_TIBO,
                 w!("BUTTON"),
@@ -545,12 +583,54 @@ fn layout_popup(window: HWND, state: &UiState) -> Result<()> {
         let mut rect = RECT::default();
         GetClientRect(window, &mut rect)?;
         let usage = usage_text(state);
-        let height = text_height(window, &usage, rect.right - 20)?
-            .min(rect.bottom - 16)
-            .max(1);
-        let label = GetDlgItem(Some(window), POPUP_USAGE)?;
-        SetWindowTextW(label, &HSTRING::from(usage))?;
-        MoveWindow(label, 10, 8, rect.right - 20, height, true)?;
+        let has_tweet = window == *state.tooltip_window.borrow() && state.tweet.borrow().is_some();
+        let reserve = if has_tweet {
+            let tweet = state.tweet.borrow();
+            82 + text_height(
+                window,
+                &tweet.as_ref().unwrap().0.text,
+                rect.right - 24 - GetSystemMetrics(SM_CXVSCROLL),
+            )?
+            .min(70)
+        } else {
+            16
+        };
+        let available = (rect.bottom - reserve).max(1);
+        let mut height = 0;
+        for (id, part) in [POPUP_USAGE, POPUP_NEAREST_RESET, POPUP_OTHER_RESETS]
+            .into_iter()
+            .zip(reset_parts(&usage))
+        {
+            let label = GetDlgItem(Some(window), id)?;
+            let natural = if part.is_empty() {
+                0
+            } else {
+                text_height(
+                    window,
+                    &part,
+                    rect.right - 20 - GetSystemMetrics(SM_CXVSCROLL),
+                )?
+            };
+            let section_height = natural.min((available - height).max(0));
+            SetWindowTextW(label, &HSTRING::from(part))?;
+            MoveWindow(
+                label,
+                10,
+                8 + height,
+                rect.right - 20,
+                section_height.max(1),
+                true,
+            )?;
+            let _ = ShowWindow(
+                label,
+                if section_height > 0 {
+                    SW_SHOWNA
+                } else {
+                    SW_HIDE
+                },
+            );
+            height += section_height;
+        }
         let button = GetDlgItem(Some(window), POPUP_OPEN_TIBO)?;
         let text = GetDlgItem(Some(window), POPUP_TIBO_TEXT)?;
         let tweet = state.tweet.borrow();
@@ -628,7 +708,7 @@ fn show_popup(window: HWND, reminder: bool) -> Result<()> {
         let area = info.rcWork;
         let state = &*(GetWindowLongPtrW(window, GWLP_USERDATA) as *const UiState);
         let width = 400.min(area.right - area.left - 20).max(1);
-        let usage_height = text_height(window, &usage_text(state), width - 20)?;
+        let usage_height = usage_height(window, &usage_text(state), width - 20)?;
         let body_height = if reminder {
             None
         } else {
@@ -703,7 +783,16 @@ unsafe extern "system" fn popup_proc(
         match message {
             WM_CTLCOLORSTATIC => {
                 let dc = HDC(wparam.0 as *mut c_void);
-                SetTextColor(dc, COLORREF(GetSysColor(COLOR_INFOTEXT)));
+                let nearest = GetDlgItem(Some(window), POPUP_NEAREST_RESET)
+                    .is_ok_and(|control| control.0 as isize == lparam.0);
+                SetTextColor(
+                    dc,
+                    if nearest {
+                        COLORREF(0x000000c0)
+                    } else {
+                        COLORREF(GetSysColor(COLOR_INFOTEXT))
+                    },
+                );
                 SetBkColor(dc, COLORREF(GetSysColor(COLOR_INFOBK)));
                 LRESULT(GetSysColorBrush(COLOR_INFOBK).0 as isize)
             }
@@ -1132,6 +1221,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reset_highlight_selects_only_first_known_time() {
+        let nearest = "Banked Reset 1 到期：2026-10-30 08:00（本機時間）";
+        let later = "每週重設：2026-11-04 08:00（本機時間）";
+        assert_eq!(
+            reset_parts(&format!(
+                "已用 10%\n{nearest}\n{later}\nBanked Reset：明細不完整"
+            )),
+            [
+                "已用 10%".into(),
+                nearest.into(),
+                format!("{later}\r\nBanked Reset：明細不完整")
+            ]
+        );
+        assert!(reset_parts("每週重設：時間未提供\nBanked Reset：無法取得")[1].is_empty());
+    }
+
+    #[test]
     fn hover_requires_stationary_pointer_and_resets_on_move_or_leave() {
         let mut hover = Hover::default();
         let start = Instant::now();
@@ -1238,7 +1344,7 @@ mod tests {
         assert!(unsafe { Shell_NotifyIconGetRect(&identity) }.is_ok());
         tray.update(
             Some(29.0),
-            "Codex 每週額度\nBanked Reset：1 次\n最早到期：30/10",
+            "Codex 每週額度\nBanked Reset：1 次\nBanked Reset 1 到期：2026-10-30 08:00（本機時間）\n每週重設：2026-11-04 08:00（本機時間）",
             true,
         )
         .unwrap();
@@ -1328,6 +1434,19 @@ mod tests {
             );
             assert_eq!(brush.0, GetSysColorBrush(COLOR_INFOBK).0 as isize);
             assert_eq!(GetTextColor(dc).0, GetSysColor(COLOR_INFOTEXT));
+            let nearest = GetDlgItem(Some(first), POPUP_NEAREST_RESET).unwrap();
+            assert!(IsWindowVisible(nearest).as_bool(), "最近 Reset 應保持可見");
+            SendMessageW(
+                first,
+                WM_CTLCOLORSTATIC,
+                Some(WPARAM(dc.0 as usize)),
+                Some(LPARAM(nearest.0 as isize)),
+            );
+            assert_eq!(
+                GetTextColor(dc),
+                COLORREF(0x000000c0),
+                "最近 Reset 應使用紅色"
+            );
             ReleaseDC(Some(text), dc);
             SendMessageW(
                 window,
@@ -1423,6 +1542,35 @@ mod tests {
             assert_ne!(
                 IsWindowVisible(first).as_bool(),
                 IsWindowVisible(second).as_bool()
+            );
+            let rows = (2..30)
+                .map(|index| format!("Banked Reset {index} 到期：2026-11-04 08:00（本機時間）"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            tray.update(
+                Some(29.0),
+                &format!("Banked Reset 1 到期：2026-10-30 08:00（本機時間）\n{rows}"),
+                true,
+            )
+            .unwrap();
+            SendMessageW(window, UPDATE, None, None);
+            let remaining = GetDlgItem(Some(second), POPUP_OTHER_RESETS).unwrap();
+            assert!(IsWindowVisible(remaining).as_bool());
+            SendMessageW(
+                remaining,
+                windows::Win32::UI::Controls::EM_LINESCROLL,
+                None,
+                Some(LPARAM(3)),
+            );
+            assert!(
+                SendMessageW(
+                    remaining,
+                    windows::Win32::UI::Controls::EM_GETFIRSTVISIBLELINE,
+                    None,
+                    None
+                )
+                .0 > 0,
+                "其餘 Reset 明細應可捲動"
             );
         }
         drop(tray);

@@ -13,6 +13,7 @@ pub struct WeeklyUsage {
 pub struct BankedReset {
     pub count: u64,
     pub expires_at: Option<i64>,
+    pub expiries: Vec<i64>,
     pub incomplete: bool,
 }
 
@@ -29,6 +30,7 @@ pub fn parse_banked(result: &Value, now: i64) -> Option<BankedReset> {
         return Some(BankedReset {
             count,
             expires_at: None,
+            expiries: Vec::new(),
             incomplete: false,
         });
     }
@@ -36,6 +38,7 @@ pub fn parse_banked(result: &Value, now: i64) -> Option<BankedReset> {
         return Some(BankedReset {
             count,
             expires_at: None,
+            expiries: Vec::new(),
             incomplete: true,
         });
     };
@@ -50,10 +53,12 @@ pub fn parse_banked(result: &Value, now: i64) -> Option<BankedReset> {
             expiries.push(expiry);
         }
     }
+    expiries.sort_unstable();
     Some(BankedReset {
         count,
-        expires_at: expiries.iter().copied().min(),
+        expires_at: expiries.first().copied(),
         incomplete: expiries.len() as u64 != count,
+        expiries,
     })
 }
 
@@ -186,6 +191,7 @@ mod tests {
             Some(BankedReset {
                 count: 0,
                 expires_at: None,
+                expiries: vec![],
                 incomplete: false
             })
         );
@@ -198,6 +204,7 @@ mod tests {
             Some(BankedReset {
                 count: 2,
                 expires_at: Some(200),
+                expiries: vec![200, 300],
                 incomplete: false
             })
         );
@@ -207,6 +214,7 @@ mod tests {
             Some(BankedReset {
                 count: 2,
                 expires_at: Some(300),
+                expiries: vec![300],
                 incomplete: true
             })
         );
@@ -216,6 +224,7 @@ mod tests {
             Some(BankedReset {
                 count: 2,
                 expires_at: None,
+                expiries: vec![],
                 incomplete: true
             })
         );
